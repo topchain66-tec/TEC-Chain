@@ -1,0 +1,299 @@
+
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"math/big"
+	"net/http"
+	"os"
+	"os/signal"
+	"sort"
+	"sync"
+	"syscall"
+	"time"
+)
+
+// ====================== Core Types ======================
+type Address [20]byte
+type Hash [32]byte
+
+func (a Address) String() string {
+	return "TEC" + hex.EncodeToString(a[:])[:38]
+}
+
+func (h Hash) String() string {
+	return hex.EncodeToString(h[:])
+}
+
+type BlockHeader struct {
+	ParentHash Hash
+	Height     int64
+	Timestamp  int64
+	Nonce      uint64
+	Validator  Address
+	Difficulty *big.Int
+}
+
+type Block struct {
+	Header *BlockHeader
+	Txs    []Transaction
+	Hash   Hash
+}
+
+type Transaction struct {
+	From      Address
+	To        Address
+	Amount    *big.Int
+	Fee       *big.Int
+	Nonce     uint64
+	Signature []byte
+	Hash      Hash
+}
+
+func (tx Transaction) CalculateHash() Hash {
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, tx.From[:])
+	binary.Write(buf, binary.BigEndian, tx.To[:])
+	binary.Write(buf, binary.BigEndian, tx.Amount.Bytes())
+	binary.Write(buf, binary.BigEndian, tx.Fee.Bytes())
+	binary.Write(buf, binary.BigEndian, tx.Nonce)
+	return sha256.Sum256(buf.Bytes())
+}
+
+// ====================== Ledger ======================
+type AccountState struct {
+	Balance    *big.Int
+	Stake      *big.Int
+	VoteWeight *big.Int
+	Nonce      uint64
+}
+
+type Ledger struct {
+	mu     sync.RWMutex
+	States map[Address]*AccountState
+}
+
+func NewLedger() *Ledger {
+	return &Ledger{States: make(map[Address]*AccountState)}
+}
+
+func (l *Ledger) ApplyTransaction(tx Transaction) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	sender := l.States[tx.From]
+	if sender == nil || sender.Nonce != tx.Nonce {
+		return errors.New("invalid transaction")
+	}
+
+	total := new(big.Int).Add(tx.Amount, tx.Fee)
+	if sender.Balance.Cmp(total) < 0 {
+		return errors.New("insufficient balance")
+	}
+
+	sender.Balance.Sub(sender.Balance, total)
+	sender.Nonce++
+
+	if _, ok := l.States[tx.To]; !ok {
+		l.States[tx.To] = &AccountState{Balance: big.NewInt(0)}
+	}
+	l.States[tx.To].Balance.Add(l.States[tx.To].Balance, tx.Amount)
+	return nil
+}
+
+// ====================== Mempool ======================
+type Mempool struct {
+	txs map[Hash]Transaction
+	mu  sync.RWMutex
+}
+
+func NewMempool() *Mempool {
+	return &Mempool{txs: make(map[Hash]Transaction)}
+}
+
+func (m *Mempool) Add(tx Transaction) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.txs[tx.CalculateHash()] = tx
+}
+
+func (m *Mempool) Pending() []Transaction {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var list []Transaction
+	for _, tx := range m.txs {
+		list = append(list, tx)
+	}
+	return list
+}
+
+func (m *Mempool) Clear(txs []Transaction) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, tx := range txs {
+		delete(m.txs, tx.Hash)
+	}
+}
+
+// ====================== Node ======================
+type Node struct {
+	Ledger    *Ledger
+	Mempool   *Mempool
+	Chain     []*Block
+	mu        sync.RWMutex
+	shutdown  chan struct{}
+}
+
+func NewNode() *Node {
+	ledger := NewLedger()
+
+	// Initialize test accounts
+	for i := 0; i < 30; i++ {
+		var addr Address
+		binary.BigEndian.PutUint64(addr[:], uint64(1000+i))
+		ledger.States[addr] = &AccountState{
+			Balance:    big.NewInt(100000 * 1e18),
+			Stake:      big.NewInt(5000 * 1e18),
+			VoteWeight: big.NewInt(int64(i * 10)),
+		}
+	}
+
+	node := &Node{
+		Ledger:   ledger,
+		Mempool:  NewMempool(),
+		Chain:    make([]*Block, 0),
+		shutdown: make(chan struct{}),
+	}
+
+	// Genesis block
+	genesis := &Block{
+		Header: &BlockHeader{
+			Height:    0,
+			Timestamp: time.Now().Unix(),
+		},
+	}
+	genesis.Hash = Hash(sha256.Sum256([]byte("tec-genesis-block")))
+	node.Chain = append(node.Chain, genesis)
+
+	return node
+}
+
+func (n *Node) Start() {
+	ticker := time.NewTicker(10 * time.Second)
+	for {
+		select {
+		case <-n.shutdown:
+			return
+		case <-ticker.C:
+			n.produceBlock()
+		}
+	}
+}
+
+func (n *Node) produceBlock() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	height := int64(len(n.Chain))
+	proposer := n.getProposer(height)
+
+	block := &Block{
+		Header: &BlockHeader{
+			ParentHash: n.Chain[len(n.Chain)-1].Hash,
+			Height:     height,
+			Timestamp:  time.Now().Unix(),
+			Validator:  proposer,
+		},
+		Txs: n.Mempool.Pending()[:3],
+	}
+
+	// Simple PoW
+	block.Header.Nonce = uint64(time.Now().UnixNano())
+
+	// Apply transactions
+	for _, tx := range block.Txs {
+		n.Ledger.ApplyTransaction(tx)
+	}
+
+	// Miner reward
+	if acc, ok := n.Ledger.States[proposer]; ok {
+		acc.Balance.Add(acc.Balance, big.NewInt(10*1e18))
+	}
+
+	block.Hash = Hash(sha256.Sum256([]byte(fmt.Sprintf("%d", height))))
+	n.Chain = append(n.Chain, block)
+	n.Mempool.Clear(block.Txs)
+
+	fmt.Printf("✅ Block #%d | Proposer: %s | Transactions: %d\n", 
+		height, proposer.String()[:12], len(block.Txs))
+}
+
+func (n *Node) getProposer(height int64) Address {
+	keys := make([]Address, 0, len(n.Ledger.States))
+	for k := range n.Ledger.States {
+		keys = append(keys, k)
+	}
+	return keys[int(height)%len(keys)]
+}
+
+// ====================== RPC Server ======================
+func (n *Node) StartRPC() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string        `json:"method"`
+			Params []interface{} `json:"params"`
+			ID     interface{}   `json:"id"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+
+		var result interface{}
+		switch req.Method {
+		case "tec_getBlockByNumber":
+			result = map[string]interface{}{"height": 1}
+		case "tec_getBalance":
+			result = "100000000000000000000"
+		case "tec_sendRawTransaction":
+			result = "0xTransactionHashExample123"
+		default:
+			result = "Method not implemented yet"
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"jsonrpc": "2.0",
+			"result":  result,
+			"id":      req.ID,
+		})
+	})
+
+	log.Println("RPC Server started on :8545")
+	log.Fatal(http.ListenAndServe(":8545", nil))
+}
+
+func (n *Node) Stop() {
+	close(n.shutdown)
+}
+
+// ====================== Main ======================
+func main() {
+	node := NewNode()
+
+	go node.StartRPC()
+	go node.Start()
+
+	fmt.Println("🚀 TEC-CHAIN started successfully")
+	fmt.Println("📡 JSON-RPC endpoint: http://localhost:8545")
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	node.Stop()
+	fmt.Println("\n👋 TEC-CHAIN shutdown complete")
+}
